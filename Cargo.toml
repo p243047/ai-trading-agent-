@@ -1,0 +1,33 @@
+[package]
+name = "quant-trading-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async Runtime & Networking
+tokio = { version = "1.38", features = ["full"] }
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+reqwest = { version = "0.12", features = ["json"] }
+futures-util = "0.3"
+
+# Data Scraper & HTML Parsing
+scraper = "0.19"
+
+# Math & Quantitative Computing
+ndarray = "0.15"
+statrs = "0.16"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Local AI & ML (optional - can be disabled if candle has issues)
+ollama-rs = "0.1"
+# candle-core and candle-nn are optional for advanced ML features
+# candle-core = "0.6"
+# candle-nn = "0.6"
+
+# Utilities & Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
