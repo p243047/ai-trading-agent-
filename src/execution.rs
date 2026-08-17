@@ -8,66 +8,53 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
-use crate::types::TradeSignal;
+use crate::types::{TradeSignal, PaperTrade as TradeRecord, TradeType, Direction};
 
 /// Path to paper trades log file
 const PAPER_TRADES_FILE: &str = "paper_trades.json";
 
-/// Paper trade record structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaperTrade {
-    pub id: String,
-    pub symbol: String,
-    pub direction: String,
-    pub entry_price: f64,
-    pub stop_loss: f64,
-    pub take_profit: f64,
-    pub position_size_pct: f64,
-    pub win_probability: f64,
-    pub entry_time: DateTime<Utc>,
-    pub exit_time: Option<DateTime<Utc>>,
-    pub exit_price: Option<f64>,
-    pub pnl_pct: Option<f64>,
-    pub status: String, // "OPEN", "CLOSED", "STOPPED_OUT", "TP_HIT"
-}
-
-impl PaperTrade {
-    pub fn from_signal(signal: &TradeSignal) -> Self {
-        PaperTrade {
-            id: generate_trade_id(&signal.symbol),
-            symbol: signal.symbol.clone(),
-            direction: signal.action.clone(),
-            entry_price: signal.current_price,
-            stop_loss: signal.stop_loss,
-            take_profit: signal.target_price,
-            position_size_pct: signal.recommended_position_pct,
-            win_probability: signal.win_probability,
-            entry_time: Utc::now(),
-            exit_time: None,
-            exit_price: None,
-            pnl_pct: None,
-            status: "OPEN".to_string(),
-        }
-    }
-}
-
-/// Generate unique trade ID
+/// Generate unique trade ID using UUID
 fn generate_trade_id(symbol: &str) -> String {
-    let timestamp = Utc::now().timestamp();
-    format!("{}_{}", symbol, timestamp)
+    use uuid::Uuid;
+    Uuid::new_v4().to_string()
 }
 
 /// Log a new paper trade to the JSON file
 pub fn log_paper_trade(signal: &TradeSignal) -> Result<(), Box<dyn std::error::Error>> {
-    let mut trade = PaperTrade::from_signal(signal);
+    let coin_name = signal.coin_name.clone();
+    let trade_type = signal.trade_type;
+    let direction = match signal.action.as_str() {
+        "LONG" => Direction::Long,
+        "SHORT" => Direction::Short,
+        _ => return Ok(()), // Don't log HOLD signals
+    };
+    
+    let mut trade = TradeRecord::new(
+        &signal.symbol,
+        &coin_name,
+        trade_type,
+        direction,
+        &signal.action,
+        signal.win_probability,
+        signal.current_price,
+        signal.target_price,
+        signal.stop_loss,
+        signal.recommended_position_pct,
+        signal.kelly_fraction,
+    );
     
     info!(
-        "📝 Paper Trade Logged: {} {} @ ${:.2} (SL: ${:.2}, TP: ${:.2})",
-        trade.direction,
-        trade.symbol,
+        "📝 Paper Trade Logged: {} {} {} @ ${:.2} (SL: ${:.2}, TP: ${:.2}, Prob: {:.1}%)",
+        trade.action,
+        trade.coin_name,
+        match trade.trade_type {
+            TradeType::Spot => "(SPOT)",
+            TradeType::Futures => "(FUTURES)",
+        },
         trade.entry_price,
         trade.stop_loss,
-        trade.take_profit
+        trade.target_price,
+        trade.win_probability * 100.0
     );
     
     // Load existing trades
@@ -91,22 +78,14 @@ pub fn update_paper_trade(
     let mut trades = load_paper_trades()?;
     
     for trade in &mut trades {
-        if trade.id == trade_id {
-            trade.exit_time = Some(Utc::now());
-            trade.exit_price = Some(exit_price);
-            trade.status = status.to_string();
-            
-            // Calculate PnL
-            let pnl = calculate_pnl(
-                &trade.direction,
-                trade.entry_price,
-                exit_price,
-            );
-            trade.pnl_pct = Some(pnl);
+        if trade.trade_id == trade_id {
+            trade.close_trade(exit_price, status);
             
             info!(
                 "✅ Trade Closed: {} | PnL: {:.2}% | Status: {}",
-                trade_id, pnl, status
+                trade_id, 
+                trade.pnl_pct.unwrap_or(0.0), 
+                status
             );
             
             break;
@@ -118,16 +97,15 @@ pub fn update_paper_trade(
 }
 
 /// Calculate PnL percentage for a trade
-fn calculate_pnl(direction: &str, entry: f64, exit: f64) -> f64 {
+fn calculate_pnl(direction: Direction, entry: f64, exit: f64) -> f64 {
     match direction {
-        "LONG" => ((exit - entry) / entry) * 100.0,
-        "SHORT" => ((entry - exit) / entry) * 100.0,
-        _ => 0.0,
+        Direction::Long => ((exit - entry) / entry) * 100.0,
+        Direction::Short => ((entry - exit) / entry) * 100.0,
     }
 }
 
 /// Load all paper trades from JSON file
-pub fn load_paper_trades() -> Result<Vec<PaperTrade>, Box<dyn std::error::Error>> {
+pub fn load_paper_trades() -> Result<Vec<TradeRecord>, Box<dyn std::error::Error>> {
     if !Path::new(PAPER_TRADES_FILE).exists() {
         return Ok(Vec::new());
     }
@@ -140,12 +118,12 @@ pub fn load_paper_trades() -> Result<Vec<PaperTrade>, Box<dyn std::error::Error>
         return Ok(Vec::new());
     }
     
-    let trades: Vec<PaperTrade> = serde_json::from_str(&contents)?;
+    let trades: Vec<TradeRecord> = serde_json::from_str(&contents)?;
     Ok(trades)
 }
 
 /// Save paper trades to JSON file
-fn save_paper_trades(trades: &[PaperTrade]) -> Result<(), Box<dyn std::error::Error>> {
+fn save_paper_trades(trades: &[TradeRecord]) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(trades)?;
     let mut file = File::create(PAPER_TRADES_FILE)?;
     file.write_all(json.as_bytes())?;
@@ -157,16 +135,16 @@ pub fn get_performance_stats() -> Result<PerformanceStats, Box<dyn std::error::E
     let trades = load_paper_trades()?;
     
     let total_trades = trades.len();
-    let closed_trades: Vec<&PaperTrade> = trades.iter()
+    let closed_trades: Vec<&TradeRecord> = trades.iter()
         .filter(|t| t.status != "OPEN")
         .collect();
     
     let winning_trades = closed_trades.iter()
-        .filter(|t| t.pnl_pct.unwrap_or(0.0) > 0.0)
+        .filter(|t| t.success.unwrap_or(false))
         .count();
     
     let losing_trades = closed_trades.iter()
-        .filter(|t| t.pnl_pct.unwrap_or(0.0) <= 0.0)
+        .filter(|t| !(t.success.unwrap_or(false)))
         .count();
     
     let total_pnl: f64 = closed_trades.iter()
@@ -217,10 +195,16 @@ impl std::fmt::Display for PerformanceStats {
     }
 }
 
-/// Simulate checking open trades against current prices
-pub fn check_open_trades(current_prices: &[(&str, f64)]) -> Result<(), Box<dyn std::error::Error>> {
+/// Simulate checking open trades against current prices and close some randomly for demo
+pub fn check_open_trades(current_prices: &[(String, f64)]) -> Result<(), Box<dyn std::error::Error>> {
     let mut trades = load_paper_trades()?;
     let mut updated = false;
+    
+    // Create a price map
+    let price_map: std::collections::HashMap<String, f64> = current_prices
+        .iter()
+        .map(|(s, p)| (s.clone(), *p))
+        .collect();
     
     for trade in &mut trades {
         if trade.status != "OPEN" {
@@ -228,43 +212,101 @@ pub fn check_open_trades(current_prices: &[(&str, f64)]) -> Result<(), Box<dyn s
         }
         
         // Find current price for this symbol
-        let current_price = current_prices.iter()
-            .find(|(symbol, _)| *symbol == trade.symbol)
-            .map(|(_, price)| *price);
-        
-        if let Some(price) = current_price {
+        if let Some(&price) = price_map.get(&trade.symbol) {
             // Check if stop loss hit
-            if trade.direction == "LONG" && price <= trade.stop_loss {
-                trade.exit_time = Some(Utc::now());
-                trade.exit_price = Some(price);
-                trade.pnl_pct = Some(calculate_pnl(&trade.direction, trade.entry_price, price));
-                trade.status = "STOPPED_OUT".to_string();
+            if trade.direction == Direction::Long && price <= trade.stop_loss {
+                trade.close_trade(price, "STOPPED");
                 updated = true;
-                info!("❌ Stop Loss Hit: {} @ ${:.2}", trade.symbol, price);
-            } else if trade.direction == "SHORT" && price >= trade.stop_loss {
-                trade.exit_time = Some(Utc::now());
-                trade.exit_price = Some(price);
-                trade.pnl_pct = Some(calculate_pnl(&trade.direction, trade.entry_price, price));
-                trade.status = "STOPPED_OUT".to_string();
+                info!("❌ Stop Loss Hit: {} @ ${:.2} | PnL: {:.2}%", 
+                    trade.symbol, price, trade.pnl_pct.unwrap_or(0.0));
+            } else if trade.direction == Direction::Short && price >= trade.stop_loss {
+                trade.close_trade(price, "STOPPED");
                 updated = true;
-                info!("❌ Stop Loss Hit: {} @ ${:.2}", trade.symbol, price);
+                info!("❌ Stop Loss Hit: {} @ ${:.2} | PnL: {:.2}%", 
+                    trade.symbol, price, trade.pnl_pct.unwrap_or(0.0));
             }
             
             // Check if take profit hit
-            if trade.direction == "LONG" && price >= trade.take_profit {
-                trade.exit_time = Some(Utc::now());
-                trade.exit_price = Some(price);
-                trade.pnl_pct = Some(calculate_pnl(&trade.direction, trade.entry_price, price));
-                trade.status = "TP_HIT".to_string();
+            if trade.direction == Direction::Long && price >= trade.target_price {
+                trade.close_trade(price, "TARGET_HIT");
                 updated = true;
-                info!("🎯 Take Profit Hit: {} @ ${:.2}", trade.symbol, price);
-            } else if trade.direction == "SHORT" && price <= trade.take_profit {
-                trade.exit_time = Some(Utc::now());
-                trade.exit_price = Some(price);
-                trade.pnl_pct = Some(calculate_pnl(&trade.direction, trade.entry_price, price));
-                trade.status = "TP_HIT".to_string();
+                info!("🎯 Take Profit Hit: {} @ ${:.2} | PnL: {:.2}%", 
+                    trade.symbol, price, trade.pnl_pct.unwrap_or(0.0));
+            } else if trade.direction == Direction::Short && price <= trade.target_price {
+                trade.close_trade(price, "TARGET_HIT");
                 updated = true;
-                info!("🎯 Take Profit Hit: {} @ ${:.2}", trade.symbol, price);
+                info!("🎯 Take Profit Hit: {} @ ${:.2} | PnL: {:.2}%", 
+                    trade.symbol, price, trade.pnl_pct.unwrap_or(0.0));
+            }
+        }
+    }
+    
+    if updated {
+        save_paper_trades(&trades)?;
+    }
+    
+    Ok(())
+}
+
+/// Simulate closing some open trades with random price movements for demonstration
+pub fn simulate_trade_closures(current_prices: &[(String, f64)]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut trades = load_paper_trades()?;
+    let mut updated = false;
+    
+    // Create a price map
+    let price_map: std::collections::HashMap<String, f64> = current_prices
+        .iter()
+        .map(|(s, p)| (s.clone(), *p))
+        .collect();
+    
+    for trade in &mut trades {
+        if trade.status != "OPEN" {
+            continue;
+        }
+        
+        if let Some(&base_price) = price_map.get(&trade.symbol) {
+            // Simulate random price movement for demo purposes
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let seed = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let random_factor = ((seed as f64 * 0.001).sin() + 1.0) / 2.0; // 0 to 1
+            
+            // 30% chance to close each cycle for demo
+            if random_factor > 0.7 {
+                let volatility = 0.02; // 2% volatility
+                let simulated_move = (random_factor - 0.5) * volatility * 2.0;
+                let exit_price = base_price * (1.0 + simulated_move);
+                
+                // Determine if TP or SL was hit first based on direction
+                let (status, final_price) = if trade.direction == Direction::Long {
+                    if exit_price >= trade.target_price {
+                        ("TARGET_HIT", trade.target_price)
+                    } else if exit_price <= trade.stop_loss {
+                        ("STOPPED", trade.stop_loss)
+                    } else {
+                        ("SIMULATED_EXIT", exit_price)
+                    }
+                } else {
+                    if exit_price <= trade.target_price {
+                        ("TARGET_HIT", trade.target_price)
+                    } else if exit_price >= trade.stop_loss {
+                        ("STOPPED", trade.stop_loss)
+                    } else {
+                        ("SIMULATED_EXIT", exit_price)
+                    }
+                };
+                
+                trade.close_trade(final_price, status);
+                updated = true;
+                
+                let emoji = match status {
+                    "TARGET_HIT" => "🎯",
+                    "STOPPED" => "❌",
+                    _ => "📊",
+                };
+                
+                info!("{} Trade Closed: {} {} | Entry: ${:.2} | Exit: ${:.2} | PnL: {:.2}%",
+                    emoji, trade.action, trade.symbol, trade.entry_price, final_price, 
+                    trade.pnl_pct.unwrap_or(0.0));
             }
         }
     }
@@ -282,19 +324,19 @@ mod tests {
 
     #[test]
     fn test_pnl_calculation_long() {
-        let pnl = calculate_pnl("LONG", 100.0, 110.0);
+        let pnl = calculate_pnl(Direction::Long, 100.0, 110.0);
         assert!((pnl - 10.0).abs() < 0.01);
     }
 
     #[test]
     fn test_pnl_calculation_short() {
-        let pnl = calculate_pnl("SHORT", 100.0, 90.0);
+        let pnl = calculate_pnl(Direction::Short, 100.0, 90.0);
         assert!((pnl - 10.0).abs() < 0.01);
     }
 
     #[test]
     fn test_trade_id_generation() {
         let id = generate_trade_id("BTCUSDT");
-        assert!(id.starts_with("BTCUSDT_"));
+        assert_eq!(id.len(), 36); // UUID length
     }
 }

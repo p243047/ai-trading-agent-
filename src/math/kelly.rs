@@ -2,7 +2,7 @@
 //! 
 //! Implements fractional Kelly formula for optimal position sizing
 
-use crate::types::{TradeSignal, MarketMetrics};
+use crate::types::{TradeSignal, MarketMetrics, TradeType};
 use chrono::Utc;
 
 /// Safety fraction to prevent drawdown spikes (25% of full Kelly)
@@ -68,6 +68,8 @@ pub fn generate_trade_signal(
     
     TradeSignal {
         symbol: symbol.to_string(),
+        coin_name: symbol.replace("USDT", "").to_string(),
+        trade_type: TradeType::Spot,  // Default, will be overridden in main.rs
         action: action.to_string(),
         win_probability,
         current_price,
